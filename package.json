@@ -1,0 +1,15 @@
+{
+  "name": "haven-middleware",
+  "version": "1.0.0",
+  "description": "Git Authorization Proxy for Haven",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "http-proxy": "^1.18.1"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
