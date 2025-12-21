@@ -1,15 +1,15 @@
 {
   "name": "haven-middleware",
-  "version": "1.0.0",
-  "description": "Git Authorization Proxy for Haven",
+  "version": "2.0.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "http-proxy": "^1.18.1"
-  },
-  "engines": {
-    "node": "18.x"
+    "express": "^4.18.2",
+    "http-proxy": "^1.18.1",
+    "@upstash/redis": "^1.28.0",
+    "cors": "^2.8.5",
+    "body-parser": "^1.20.2"
   }
 }

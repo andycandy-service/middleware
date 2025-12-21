@@ -1,59 +1,124 @@
-const http = require('http');
+const express = require('express');
 const httpProxy = require('http-proxy');
+const { Redis } = require('@upstash/redis');
+const crypto = require('crypto');
+const cors = require('cors');
 
 // --- CONFIGURATION ---
-// We read these from Koyeb's "Environment Variables" settings
-// format: "ghp_xxxxxxxxxxxx"
-const GITHUB_TOKEN = process.env.GH_TOKEN; 
-// format: "HavenBot" (The name of the account that owns the repos)
-const GITHUB_USERNAME = process.env.GH_USERNAME; 
 const PORT = process.env.PORT || 8000;
+const GH_USERNAME = process.env.GH_USERNAME; 
+const GH_TOKEN = process.env.GH_TOKEN;
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-// Create the Proxy Server
-const proxy = httpProxy.createProxyServer({
-    target: 'https://github.com',
-    changeOrigin: true, // Essential: Tells GitHub "I am coming from github.com"
-    secure: true        // Verifies GitHub's SSL certificate
-});
+// Initialize
+const app = express();
+const redis = new Redis({ url: UPSTASH_URL, token: UPSTASH_TOKEN });
+const proxy = httpProxy.createProxyServer({ changeOrigin: true, secure: true });
 
-// Error Handling (Prevents server crash on timeouts)
-proxy.on('error', function (err, req, res) {
-    console.error(`[Proxy Error] ${err.message}`);
-    if (res && !res.headersSent) {
-        res.writeHead(502, { 'Content-Type': 'text/plain' });
-        res.end('Bad Gateway: Connection to GitHub failed.');
-    }
-});
+app.use(cors()); // Allow requests from anywhere (for now)
 
-// --- THE SERVER ---
-const server = http.createServer((req, res) => {
-    // 1. Security Check: Only allow traffic starting with /git/
-    // Example: https://haven.koyeb.app/git/world-id.git
-    if (!req.url.startsWith('/git/')) {
-        res.writeHead(403);
-        res.end('Forbidden: Haven Middleware only accepts Git traffic.');
-        return;
-    }
-
-    // 2. URL Rewrite
-    // Client asks for: /git/world-123.git
-    // GitHub expects:  /HavenBot/world-123.git
-    // We remove "/git" and prepend the username.
-    req.url = req.url.replace('/git', '/' + GITHUB_USERNAME);
+// --- 1. THE GIT PROXY (High Priority Traffic) ---
+// Captures anything starting with /git/
+app.use('/git', (req, res) => {
+    const targetUrl = 'https://github.com';
     
-    // 3. Inject Authorization
-    // We create a "Basic Auth" header using your hidden token.
-    const authString = Buffer.from(`${GITHUB_USERNAME}:${GITHUB_TOKEN}`).toString('base64');
+    // Rewrite: /git/world-id -> /BotName/world-id
+    req.url = '/' + GH_USERNAME + req.url;
+
+    // Inject Auth
+    const authString = Buffer.from(`${GH_USERNAME}:${GH_TOKEN}`).toString('base64');
     req.headers['Authorization'] = `Basic ${authString}`;
 
-    // 4. Log for Debugging (Optional - remove in production for speed)
-    console.log(`[Proxy] Forwarding ${req.method} to GitHub: ${req.url}`);
-
-    // 5. Fire the Proxy
-    proxy.web(req, res);
+    console.log(`[Proxy] Syncing world: ${req.url}`);
+    
+    proxy.web(req, res, { target: targetUrl }, (err) => {
+        console.error("[Proxy Error]", err.message);
+        if (!res.headersSent) res.sendStatus(502);
+    });
 });
 
-server.listen(PORT, () => {
-    console.log(`Haven Middleware is running on port ${PORT}`);
-    console.log(`Target GitHub Account: ${GITHUB_USERNAME}`);
+// --- API PRE-REQUISITES ---
+// Only parse JSON for API routes (NOT for Git binary streams!)
+app.use('/api', express.json());
+
+// --- 2. REGISTRATION (Offline Mode Support) ---
+app.post('/api/register', async (req, res) => {
+    const { username } = req.body;
+    if (!username || username.length > 16) return res.status(400).json({ error: "Invalid username" });
+
+    try {
+        // Atomic Counter: Get next number for "Andy"
+        // key: "counter:Andy" -> 5
+        const num = await redis.incr(`counter:${username}`);
+        const tag = `${username}#${num}`;
+        
+        // Generate a "Password" for this tag so only this user can check its mail
+        const secret = crypto.randomUUID();
+        
+        // Store the Secret (Permanent)
+        await redis.set(`secret:${tag}`, secret);
+
+        console.log(`[Register] New User: ${tag}`);
+        res.json({ tag, secret });
+    } catch (err) {
+        res.status(500).json({ error: "Database error" });
+    }
+});
+
+// --- 3. SEND INVITE (The Mailbox) ---
+app.post('/api/invite', async (req, res) => {
+    const { targetTag, senderTag, ip, worldName } = req.body;
+    
+    // We store invites in a Hash Map to prevent duplicates
+    // Key: inbox:Andy#5
+    // Field: Steve#1
+    // Value: JSON Data
+    const inviteData = JSON.stringify({ ip, worldName, timestamp: Date.now() });
+
+    try {
+        await redis.hset(`inbox:${targetTag}`, { [senderTag]: inviteData });
+        await redis.expire(`inbox:${targetTag}`, 300); // Mailbox clears after 5 mins of inactivity
+        
+        console.log(`[Invite] ${senderTag} -> ${targetTag}`);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: "Failed to send invite" });
+    }
+});
+
+// --- 4. CHECK NOTIFICATIONS (Polling) ---
+app.post('/api/notifications', async (req, res) => {
+    const { tag, secret } = req.body;
+
+    // 1. Verify Identity
+    const storedSecret = await redis.get(`secret:${tag}`);
+    if (!storedSecret || storedSecret !== secret) {
+        return res.status(403).json({ error: "Unauthorized" });
+    }
+
+    // 2. Fetch & Clear Inbox
+    try {
+        const inbox = await redis.hgetall(`inbox:${tag}`);
+        
+        if (!inbox) return res.json({ invites: [] });
+
+        // Atomic Delete (So we don't show the same invite twice)
+        await redis.del(`inbox:${tag}`);
+
+        // Convert Hash to List
+        const invites = Object.keys(inbox).map(sender => {
+            const data = inbox[sender]; // It's already an object if using @upstash/redis automatic parsing
+            return { sender, ...data }; 
+        });
+
+        res.json({ invites });
+    } catch (err) {
+        res.status(500).json({ error: "Polling error" });
+    }
+});
+
+// Start Server
+app.listen(PORT, () => {
+    console.log(`Haven Middleware v2.0 running on port ${PORT}`);
 });
